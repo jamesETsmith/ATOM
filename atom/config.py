@@ -589,6 +589,19 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             if not hasattr(hf_config, field):
                 setattr(hf_config, field, value)
         return hf_config
+    # Custom ATOM config classes not yet in upstream transformers.
+    # Import lazily to avoid circular deps and only pay the cost when needed.
+    _ATOM_CONFIG_CLASSES: dict[str, tuple[str, str]] = {
+        "step3p5": ("atom.model_config.step3p5", "Step3p5Config"),
+    }
+    if model_type in _ATOM_CONFIG_CLASSES:
+        mod_path, cls_name = _ATOM_CONFIG_CLASSES[model_type]
+        import importlib
+
+        mod = importlib.import_module(mod_path)
+        config_class = getattr(mod, cls_name)
+        config_dict.pop("auto_map", None)
+        return config_class.from_dict(config_dict)
     try:
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
