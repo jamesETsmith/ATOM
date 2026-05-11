@@ -17,7 +17,7 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_config.step3p5 import Step3p5Config
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import Attention
@@ -32,6 +32,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
+from atom.utils.custom_register import direct_register_custom_op
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -88,9 +89,13 @@ class Step3p5MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
         if self.swiglu_limit > 0:
-            x = x.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
+            gate, up = gate_up.chunk(2, dim=-1)
+            x = F.silu(gate).clamp(max=self.swiglu_limit) * up.clamp(
+                min=-self.swiglu_limit, max=self.swiglu_limit
+            )
+        else:
+            x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
 
@@ -98,6 +103,155 @@ class Step3p5MLP(nn.Module):
 # ---------------------------------------------------------------------------
 # MoE
 # ---------------------------------------------------------------------------
+
+
+def _unshuffle_weight(
+    w: torch.Tensor, layout: tuple[int, int] = (16, 16)
+) -> torch.Tensor:
+    """Reverse AITER shuffle_weight (inverse permutation)."""
+    IN, IK = layout
+    BK = IK * 2
+    K = 16 // w.element_size()
+    BN = IN
+    x = w.view(-1, w.shape[-2] // BN, w.shape[-1] // BK, BK // K, BN, K)
+    x = x.permute(0, 1, 4, 2, 3, 5).contiguous()
+    return x.view(*w.shape)
+
+
+def _dequant_fp8_blockscale(
+    weight_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
+) -> torch.Tensor:
+    """Dequantize FP8 block-scaled weight to bf16.
+
+    Args:
+        weight_fp8: [N, K] float8_e4m3fnuz weight (already unshuffled).
+        scale: [ceil(N/block_n), ceil(K/block_k)] float32 block scales.
+    Returns:
+        [N, K] bf16 dequantized weight.
+    """
+    N, K = weight_fp8.shape
+    sn, sk = scale.shape
+    out = weight_fp8.to(torch.float32).view(sn, block_n, sk, block_k)
+    out = out * scale[:, None, :, None]
+    return out.reshape(N, K).to(torch.bfloat16)
+
+
+# ---------------------------------------------------------------------------
+# Swiglustep MoE custom op — opaque to torch.compile / Dynamo so it can
+# use a Python loop over experts without causing graph breaks.
+# ---------------------------------------------------------------------------
+
+
+def _swiglustep_moe_forward(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Unfused MoE forward with swiglustep activation (custom op impl).
+
+    Two execution paths depending on whether we are inside CUDA graph
+    capture:
+
+    * **Graph-capture path** (fixed shapes, no CPU sync): iterates over
+      ``top_k`` assignments, gathers expert weights for all M tokens per
+      assignment, and accumulates via bmm.  Safe for the decode-sized
+      batch sizes used during capture (M ≤ 512).
+
+    * **Eager path** (dynamic shapes OK): iterates over experts, selects
+      the tokens assigned to each expert with ``nonzero``, and runs
+      standard matmul.  Memory-efficient for large-M warmup batches.
+    """
+    atom_config = get_current_atom_config()
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+
+    if not self._swiglustep_ready:
+        self._prepare_swiglustep_weights()
+
+    topk_weights, topk_ids = FusedMoE.select_experts(
+        hidden_states=hidden_states,
+        router_logits=router_logits,
+        use_grouped_topk=False,
+        top_k=self.top_k,
+        renormalize=self.renormalize,
+        scoring_func=self.scoring_func,
+        e_score_correction_bias=self.router_bias,
+    )
+
+    M = hidden_states.shape[0]
+    limit = self.swiglu_limit
+    inter_dim = self._inter_dim
+    inter_pad = self._inter_pad
+    x_bf16 = hidden_states.to(torch.bfloat16)
+
+    if torch.cuda.is_current_stream_capturing():
+        # --- Graph-capture path: fixed shapes, loop over top_k ---
+        output = torch.zeros(M, self.hidden_size, dtype=torch.bfloat16,
+                             device=hidden_states.device)
+        for k in range(self.top_k):
+            eids = topk_ids[:, k]  # [M] int32
+            w13_k = self._w13_bf16[eids.long()]  # [M, 2*inter_pad, hidden]
+            gate_up = torch.bmm(
+                w13_k, x_bf16.unsqueeze(2)
+            ).squeeze(2)  # [M, 2*inter_pad]
+            gate = gate_up[:, :inter_dim]
+            up = gate_up[:, inter_pad:inter_pad + inter_dim]
+            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+
+            w2_k = self._w2_bf16[eids.long(), :, :inter_dim]  # [M, hidden, inter_dim]
+            down = torch.bmm(
+                w2_k, act.unsqueeze(2)
+            ).squeeze(2)  # [M, hidden]
+
+            output += topk_weights[:, k:k + 1] * down
+        return output.to(hidden_states.dtype)
+    else:
+        # --- Eager path: loop over experts, dynamic indexing ---
+        output = torch.zeros(M, self.hidden_size, dtype=hidden_states.dtype,
+                             device=hidden_states.device)
+        for eid in range(self.num_experts):
+            mask = (topk_ids == eid)  # [M, top_k]
+            token_mask = mask.any(dim=1)  # [M]
+            if not token_mask.any():
+                continue
+
+            token_indices = token_mask.nonzero(as_tuple=True)[0]
+            x_sel = x_bf16[token_indices]  # [T_e, hidden]
+
+            w13 = self._w13_bf16[eid]  # [2*inter_pad, hidden]
+            gate_up = x_sel @ w13.t()  # [T_e, 2*inter_pad]
+            gate = gate_up[:, :inter_dim]
+            up = gate_up[:, inter_pad:inter_pad + inter_dim]
+            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+
+            w2 = self._w2_bf16[eid, :, :inter_dim]  # [hidden, inter_dim]
+            down = act @ w2.t()  # [T_e, hidden]
+
+            wts = topk_weights[token_indices].unsqueeze(-1)  # [T_e, top_k, 1]
+            expert_wts = mask[token_indices].float().unsqueeze(-1)  # [T_e, top_k, 1]
+            per_token_wt = (wts * expert_wts).sum(dim=1)  # [T_e, 1]
+            output[token_indices] += (per_token_wt * down).to(output.dtype)
+
+        return output
+
+
+def _swiglustep_moe_forward_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="swiglustep_moe_forward",
+    op_func=_swiglustep_moe_forward,
+    mutates_args=[],
+    fake_impl=_swiglustep_moe_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 class Step3p5MoE(nn.Module):
@@ -113,10 +267,15 @@ class Step3p5MoE(nn.Module):
         config: Step3p5Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        layer_idx: int = 0,
     ):
         super().__init__()
         self.num_experts = config.moe_num_experts
+        self.top_k = config.moe_top_k
+        self.hidden_size = config.hidden_size
         self.routed_scaling_factor = config.moe_router_scaling_factor
+        self.swiglu_limit = config.get_swiglu_limit(layer_idx)
+        self._swiglustep_ready = False
 
         # Router gate
         self.gate = ReplicatedLinear(
@@ -142,6 +301,9 @@ class Step3p5MoE(nn.Module):
         else:
             self.router_bias = None
 
+        self.renormalize = config.norm_expert_weight
+        self.scoring_func = config.moe_router_activation
+
         self.experts = FusedMoE(
             num_experts=self.num_experts,
             top_k=config.moe_top_k,
@@ -158,17 +320,66 @@ class Step3p5MoE(nn.Module):
             config=config,
         )
 
+        if self.swiglu_limit > 0:
+            self._swiglustep_layer_name = f"{prefix}.swiglustep"
+            atom_config = get_current_atom_config()
+            compilation_config = atom_config.compilation_config
+            compilation_config.static_forward_context[
+                self._swiglustep_layer_name
+            ] = self
+            logger.info(
+                "Layer %d: swiglustep enabled (limit=%.1f) for routed experts",
+                layer_idx, self.swiglu_limit,
+            )
+
+    def _prepare_swiglustep_weights(self) -> None:
+        """Dequantize FP8 expert weights to bf16 for the unfused swiglustep path.
+
+        Called lazily on first forward when swiglu_limit > 0.
+        """
+        layer = self.experts
+        w13_fp8 = layer.w13_weight.data  # [E, 2*inter_pad, hidden]
+        w13_scale = layer.w13_weight_scale.data  # [E, scale_n, scale_k]
+        w2_fp8 = layer.w2_weight.data  # [E, hidden, inter_pad]
+        w2_scale = layer.w2_weight_scale.data  # [E, scale_n, scale_k]
+
+        E = w13_fp8.shape[0]
+        inter_pad = w13_fp8.shape[1] // 2
+        hidden = w13_fp8.shape[2]
+        self._inter_pad = inter_pad
+        self._inter_dim = layer.intermediate_size_per_partition
+
+        w13_bf16 = torch.empty(E, 2 * inter_pad, hidden, dtype=torch.bfloat16,
+                               device=w13_fp8.device)
+        w2_bf16 = torch.empty(E, hidden, inter_pad, dtype=torch.bfloat16,
+                              device=w2_fp8.device)
+
+        for e in range(E):
+            w13_unshuf = _unshuffle_weight(w13_fp8[e])
+            w2_unshuf = _unshuffle_weight(w2_fp8[e])
+            w13_bf16[e] = _dequant_fp8_blockscale(w13_unshuf, w13_scale[e])
+            w2_bf16[e] = _dequant_fp8_blockscale(w2_unshuf, w2_scale[e])
+
+        self._w13_bf16 = w13_bf16
+        self._w2_bf16 = w2_bf16
+        self._swiglustep_ready = True
+        logger.info("Swiglustep weights dequantized: w13=%s, w2=%s",
+                    list(w13_bf16.shape), list(w2_bf16.shape))
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router logits in FP32
         router_logits = F.linear(
             hidden_states.float(), self.gate.weight.float()
         )
 
-        # Routed experts -- FusedMoE's sigmoid path does not apply
-        # routed_scaling_factor internally, so we scale the output here.
-        routed = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
-        )
+        if self.swiglu_limit > 0:
+            routed = torch.ops.aiter.swiglustep_moe_forward(
+                hidden_states, router_logits, self._swiglustep_layer_name
+            )
+        else:
+            routed = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
         if self.routed_scaling_factor != 1.0:
             routed = routed * self.routed_scaling_factor
         return routed
@@ -362,6 +573,7 @@ class Step3p5DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.moe",
+                layer_idx=layer_idx,
             )
             swiglu_limit_shared = config.get_swiglu_limit_shared(layer_idx)
             self.share_expert = Step3p5MLP(
