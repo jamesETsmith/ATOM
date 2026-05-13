@@ -93,6 +93,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
     # is correct for inference; set to "1" only for training / fine-tuning.
     "ATOM_REQUIRES_GRAD": lambda: os.getenv("ATOM_REQUIRES_GRAD", "0") == "1",
+    # --- Forward-pass dump (debug_helper) ---
+    "ATOM_FWD_DUMP_DIR": lambda: os.getenv("ATOM_FWD_DUMP_DIR", ""),
+    "ATOM_FWD_DUMP_LAYERS": lambda: os.getenv("ATOM_FWD_DUMP_LAYERS", ""),
+    "ATOM_FWD_DUMP_BLOCK_CLASS": lambda: os.getenv("ATOM_FWD_DUMP_BLOCK_CLASS", "Block"),
+    "ATOM_FWD_DUMP_LAYER_ATTR": lambda: os.getenv("ATOM_FWD_DUMP_LAYER_ATTR", "layer_id"),
+    "ATOM_FWD_DUMP_ONE_SHOT": lambda: os.getenv("ATOM_FWD_DUMP_ONE_SHOT", "1") == "1",
+    # --- Weight dump (debug_helper) ---
+    "ATOM_WEIGHT_DUMP_DIR": lambda: os.getenv("ATOM_WEIGHT_DUMP_DIR", ""),
+    "ATOM_WEIGHT_DUMP_EXIT": lambda: os.getenv("ATOM_WEIGHT_DUMP_EXIT", "0") == "1",
+    "ATOM_WEIGHT_DUMP_LAYERS": lambda: os.getenv("ATOM_WEIGHT_DUMP_LAYERS", ""),
+    # --- Debug top-k (debug_helper) ---
+    "ATOM_DEBUG_TOPK": lambda: os.getenv("ATOM_DEBUG_TOPK", "0") == "1",
+    "ATOM_DEBUG_TOPK_PATH": lambda: os.getenv("ATOM_DEBUG_TOPK_PATH", ""),
 }
 
 

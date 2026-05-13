@@ -580,3 +580,90 @@ class AiterAttentionMetadataBuilder:
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs
         )
         return attn_metadata, context
+
+    def compute_per_req_cache_bytes(self) -> int:
+        return 0
+
+    def slots_per_req(self) -> int:
+        return 0
+
+    def allocate_kv_cache_tensors(
+        self, num_kv_heads: int, num_draft_layers: int
+    ) -> dict[str, torch.Tensor]:
+        return {}
+
+    def build_kv_cache_tensor(self, layer_id: int, module):
+        from aiter import dtypes
+        from atom.config import KVCacheTensor
+
+        runner = self.model_runner
+        config = runner.config
+        hf_config = config.hf_config
+
+        if hasattr(module, "base_attention"):
+            if hasattr(module, "use_mla") and not module.use_mla:
+                if hasattr(runner, "is_qwen_next") and runner.is_qwen_next():
+                    mtp_start = getattr(runner, "mtp_start_layer_idx", hf_config.num_hidden_layers)
+                    if layer_id < mtp_start:
+                        attn_idx = layer_id // runner.full_attention_interval
+                    else:
+                        attn_idx = runner.num_full_attn + (layer_id - mtp_start)
+                else:
+                    attn_idx = layer_id
+
+                x = 16 // runner.kv_cache.element_size()
+                num_kv_heads = runner.num_kv_heads
+
+                k_cache = runner.kv_cache[0, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    hf_config.head_dim // x,
+                    runner.physical_block_size,
+                    x,
+                )
+                v_cache = runner.kv_cache[1, attn_idx].view(
+                    runner.num_physical_kvcache_blocks,
+                    num_kv_heads,
+                    hf_config.head_dim,
+                    runner.physical_block_size,
+                )
+                if config.kv_cache_dtype == "fp8":
+                    module.k_scale = runner.kv_scale[0, attn_idx]
+                    module.v_scale = runner.kv_scale[1, attn_idx]
+
+                module.max_model_len = config.max_model_len
+                module.k_cache = k_cache
+                module.v_cache = v_cache
+
+                return KVCacheTensor(
+                    layer_num=layer_id,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    k_scale=module.k_scale,
+                    v_scale=module.v_scale,
+                )
+            elif hasattr(module, "use_mla") and module.use_mla:
+                kv_cache = runner.kv_cache[layer_id].view(
+                    runner.num_physical_kvcache_blocks * runner.physical_block_size,
+                    1,
+                    576,
+                )
+                module.max_model_len = config.max_model_len
+                module.kv_cache = kv_cache
+
+                if getattr(runner, "is_deepseek_v32", False) and module.indexer is not None:
+                    aligned_index_dim = runner.aligned_index_dim
+                    module.indexer.k_cache.kv_cache[0] = runner.index_cache[layer_id].view(
+                        runner.num_physical_kvcache_blocks * runner.physical_block_size,
+                        1,
+                        aligned_index_dim,
+                    )
+
+                return KVCacheTensor(
+                    layer_num=layer_id,
+                    k_cache=kv_cache,
+                    v_cache=None,
+                    k_scale=None,
+                    v_scale=None,
+                )
+        return None

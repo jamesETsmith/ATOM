@@ -109,6 +109,7 @@ def _temporary_mocks():
 
     mock_plugin = types.ModuleType("atom.plugin")
     mock_plugin.is_plugin_mode = MagicMock(return_value=False)
+    mock_plugin.is_vllm = MagicMock(return_value=False)
     mock_plugin_config = types.ModuleType("atom.plugin.config")
     mock_plugin_config.PluginConfig = MagicMock()
 
