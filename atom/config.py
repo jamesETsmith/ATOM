@@ -728,6 +728,7 @@ class SpeculativeConfig:
         "qwen3_5_text": "qwen3_5_mtp",
         "qwen3_5_moe_text": "qwen3_5_mtp",
         "mimo_v2_flash": "mimo_v2_flash_mtp",
+        "step3p5": "step3p5_mtp",
     }
 
     # mtp_model_type → (n_predict_attr, architecture)
@@ -735,6 +736,7 @@ class SpeculativeConfig:
         "deepseek_mtp": ("num_nextn_predict_layers", "DeepSeekMTPModel"),
         "qwen3_next_mtp": ("num_nextn_predict_layers", "Qwen3NextMTPModel"),
         "qwen3_5_mtp": ("mtp_num_hidden_layers", "Qwen3_5MTPModel"),
+        "step3p5_mtp": ("num_nextn_predict_layers", "Step3p5MTPModel"),
     }
 
     def __post_init__(self):

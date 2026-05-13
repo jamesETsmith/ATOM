@@ -465,3 +465,158 @@ class TestModelFileStructure:
     def test_no_unused_imports(self, src):
         """extract_layer_index was removed as unused."""
         assert "extract_layer_index" not in src
+
+
+# ===========================================================================
+# MTP weight remapping
+# ===========================================================================
+
+
+class TestMTPWeightRemapping:
+    """Verify weight name remapping for the Step3p5 MTP model."""
+
+    @pytest.fixture
+    def config(self):
+        return Step3p5Config(
+            **{**REALISTIC_KWARGS, "num_nextn_predict_layers": 3}
+        )
+
+    @pytest.fixture
+    def remap_funcs(self):
+        """Extract the pure-Python remap functions from step3p5_mtp.py
+        without triggering heavy imports (torch, aiter, etc.)."""
+        import ast
+        import os
+
+        path = os.path.join(ATOM_ROOT, "atom", "models", "step3p5_mtp.py")
+        with open(path) as f:
+            source = f.read()
+
+        tree = ast.parse(source)
+        func_sources = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                "_get_spec_layer_idx",
+                "_rewrite_spec_layer_name",
+            ):
+                func_sources.append(ast.get_source_segment(source, node))
+
+        assert len(func_sources) == 2, "Expected 2 remap functions"
+        ns = {"Step3p5Config": Step3p5Config}
+        for src in func_sources:
+            exec(src, ns)
+        return ns
+
+    def _remap(self, remap_funcs, config, name):
+        idx = remap_funcs["_get_spec_layer_idx"](config, name)
+        if idx is None:
+            return None
+        return remap_funcs["_rewrite_spec_layer_name"](idx, name)
+
+    def test_enorm_stays_at_layer_level(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.45.enorm.weight")
+        assert result == "model.layers.45.enorm.weight"
+
+    def test_hnorm_stays_at_layer_level(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.46.hnorm.weight")
+        assert result == "model.layers.46.hnorm.weight"
+
+    def test_eh_proj_stays_at_layer_level(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.47.eh_proj.weight")
+        assert result == "model.layers.47.eh_proj.weight"
+
+    def test_self_attn_gets_mtp_block_prefix(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.45.self_attn.q_proj.weight")
+        assert result == "model.layers.45.mtp_block.self_attn.q_proj.weight"
+
+    def test_mlp_gets_mtp_block_prefix(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.46.mlp.gate_proj.weight")
+        assert result == "model.layers.46.mtp_block.mlp.gate_proj.weight"
+
+    def test_input_layernorm_gets_mtp_block_prefix(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.45.input_layernorm.weight")
+        assert result == "model.layers.45.mtp_block.input_layernorm.weight"
+
+    def test_post_attn_layernorm_gets_mtp_block_prefix(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.47.post_attention_layernorm.weight")
+        assert result == "model.layers.47.mtp_block.post_attention_layernorm.weight"
+
+    def test_shared_head_norm_remapped(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.45.transformer.shared_head.norm.weight")
+        assert result == "model.layers.45.shared_head.norm.weight"
+
+    def test_shared_head_output_remapped_to_head(self, config, remap_funcs):
+        result = self._remap(remap_funcs, config, "model.layers.45.transformer.shared_head.output.weight")
+        assert result == "model.layers.45.shared_head.head.weight"
+
+    def test_top_level_embed_tokens_passthrough(self, config, remap_funcs):
+        # The Step-3.5-Flash checkpoint stores embed_tokens at top level
+        # (model.embed_tokens.weight); the MTP container reuses it as a
+        # shared weight and the name should pass through unchanged.
+        idx = remap_funcs["_get_spec_layer_idx"](config, "model.embed_tokens.weight")
+        assert idx is None  # not under model.layers.{45..47}
+        # Even when applied directly, the layer-prefixed form is not a
+        # real checkpoint weight; verify embed_tokens at top level passes through.
+        result = remap_funcs["_rewrite_spec_layer_name"](45, "model.embed_tokens.weight")
+        assert result == "model.embed_tokens.weight"
+
+    def test_non_mtp_layer_returns_none(self, config, remap_funcs):
+        idx = remap_funcs["_get_spec_layer_idx"](config, "model.layers.44.self_attn.q_proj.weight")
+        assert idx is None
+
+    def test_all_checkpoint_weights_remap(self, config, remap_funcs):
+        """Every real checkpoint weight name for MTP layers should remap."""
+        checkpoint_names = [
+            "model.layers.45.eh_proj.weight",
+            "model.layers.45.enorm.weight",
+            "model.layers.45.hnorm.weight",
+            "model.layers.45.input_layernorm.weight",
+            "model.layers.45.mlp.down_proj.weight",
+            "model.layers.45.mlp.gate_proj.weight",
+            "model.layers.45.mlp.up_proj.weight",
+            "model.layers.45.post_attention_layernorm.weight",
+            "model.layers.45.self_attn.g_proj.weight",
+            "model.layers.45.self_attn.k_norm.weight",
+            "model.layers.45.self_attn.k_proj.weight",
+            "model.layers.45.self_attn.o_proj.weight",
+            "model.layers.45.self_attn.q_norm.weight",
+            "model.layers.45.self_attn.q_proj.weight",
+            "model.layers.45.self_attn.v_proj.weight",
+            "model.layers.45.transformer.shared_head.norm.weight",
+            "model.layers.45.transformer.shared_head.output.weight",
+        ]
+        for name in checkpoint_names:
+            result = self._remap(remap_funcs, config, name)
+            assert result is not None, f"Failed to remap: {name}"
+            assert result != name or "enorm" in name or "hnorm" in name or "eh_proj" in name, (
+                f"Unexpected no-op remap: {name} -> {result}"
+            )
+
+
+# ===========================================================================
+# MTP registration
+# ===========================================================================
+
+
+class TestMTPRegistration:
+    """Verify MTP model is registered in config.py and eagle.py."""
+
+    def test_mtp_type_map_has_step3p5(self):
+        path = os.path.join(ATOM_ROOT, "atom", "config.py")
+        with open(path) as f:
+            content = f.read()
+        assert '"step3p5": "step3p5_mtp"' in content
+
+    def test_mtp_config_has_step3p5_mtp(self):
+        path = os.path.join(ATOM_ROOT, "atom", "config.py")
+        with open(path) as f:
+            content = f.read()
+        assert '"step3p5_mtp"' in content
+        assert '"Step3p5MTPModel"' in content
+
+    def test_eagle_arch_dict_has_step3p5(self):
+        path = os.path.join(ATOM_ROOT, "atom", "spec_decode", "eagle.py")
+        with open(path) as f:
+            content = f.read()
+        assert '"Step3p5MTPModel"' in content
+        assert "atom.models.step3p5_mtp.Step3p5MTP" in content

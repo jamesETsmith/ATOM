@@ -1149,21 +1149,23 @@ class ModelRunner:
                 * 4  # float32
             )
         else:
-            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
-            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
-            # the standard path (draft layers use separate binding).
+            # Standard attention: kv_cache [2, total_num_layers, blocks, ...]
+            # total_num_layers includes draft (MTP) layers when speculative
+            # decoding is enabled, so the draft model can index into the same
+            # tensor at attn_idx = layer_id (which starts at num_hidden_layers
+            # for MTP layers).
             block_bytes = (
                 2
-                * hf_config.num_hidden_layers
+                * total_num_layers
                 * self.block_size
                 * num_kv_heads
                 * hf_config.head_dim
                 * kv_dtype_size
             )
-            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
+            # kv_scale: [2, total_num_layers, blocks, kv_heads, phys_block_size]
             block_bytes += (
                 2
-                * hf_config.num_hidden_layers
+                * total_num_layers
                 * num_kv_heads
                 * self.physical_block_size
                 * 4  # float32
@@ -1414,9 +1416,11 @@ class ModelRunner:
             self.kv_scale = None
             self._kv_layer_cache_store = []
         else:
+            # Standard attention: include draft (MTP) layers so MTP layer_ids
+            # (e.g. 45..47 for Step-3.5-Flash) can index into the same tensor.
             self.kv_cache = torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 self.num_physical_kvcache_blocks,
                 self.physical_block_size,
                 num_kv_heads,
@@ -1427,7 +1431,7 @@ class ModelRunner:
 
             self.kv_scale = torch.zeros(
                 2,
-                hf_config.num_hidden_layers,
+                total_num_layers,
                 self.num_physical_kvcache_blocks,
                 num_kv_heads,
                 self.physical_block_size,

@@ -18,6 +18,7 @@ support_eagle_model_arch_dict = {
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
     "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
+    "Step3p5MTPModel": "atom.models.step3p5_mtp.Step3p5MTP",
 }
 
 

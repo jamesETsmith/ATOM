@@ -11,8 +11,10 @@ from typing import Optional, Union
 import torch
 import torch.nn.functional as F
 
+from aiter import QuantType
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
+    get_dp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -33,6 +35,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import get_forward_context
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -145,6 +148,78 @@ def _dequant_fp8_blockscale(
 # ---------------------------------------------------------------------------
 
 
+def _swiglustep_unfused_compute(
+    x_bf16: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    num_experts: int,
+    inter_dim: int,
+    inter_pad: int,
+    hidden_size: int,
+    limit: float,
+    top_k: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Core swiglustep computation on (possibly dispatched) tokens.
+
+    Works for both EP and non-EP: expert IDs in ``topk_ids`` must index
+    into ``w13_bf16`` / ``w2_bf16`` directly (local IDs under EP).
+    """
+    M = x_bf16.shape[0]
+    if torch.cuda.is_current_stream_capturing():
+        # Chunked graph-capture path: gathering expert weights for all M
+        # tokens at once (w13_bf16[eids]) creates an [M, 2*inter_pad, H]
+        # tensor that can OOM for large decode batches (e.g. M=512 with
+        # 288 experts → ~10 GiB).  Process in fixed-size chunks instead.
+        _CHUNK = 64
+        output = torch.zeros(M, hidden_size, dtype=torch.bfloat16,
+                             device=x_bf16.device)
+        for k in range(top_k):
+            eids = topk_ids[:, k]
+            wts_k = topk_weights[:, k:k + 1]
+            for c_start in range(0, M, _CHUNK):
+                c_end = min(c_start + _CHUNK, M)
+                c_eids = eids[c_start:c_end]
+                w13_c = w13_bf16[c_eids.long()]
+                x_c = x_bf16[c_start:c_end]
+                gate_up = torch.bmm(
+                    w13_c, x_c.unsqueeze(2)
+                ).squeeze(2)
+                gate = gate_up[:, :inter_dim]
+                up = gate_up[:, inter_pad:inter_pad + inter_dim]
+                act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+                w2_c = w2_bf16[c_eids.long(), :, :inter_dim]
+                down = torch.bmm(
+                    w2_c, act.unsqueeze(2)
+                ).squeeze(2)
+                output[c_start:c_end] += wts_k[c_start:c_end] * down
+        return output.to(out_dtype)
+    else:
+        output = torch.zeros(M, hidden_size, dtype=out_dtype,
+                             device=x_bf16.device)
+        for eid in range(num_experts):
+            mask = (topk_ids == eid)
+            token_mask = mask.any(dim=1)
+            if not token_mask.any():
+                continue
+            token_indices = token_mask.nonzero(as_tuple=True)[0]
+            x_sel = x_bf16[token_indices]
+            w13 = w13_bf16[eid]
+            gate_up = x_sel @ w13.t()
+            gate = gate_up[:, :inter_dim]
+            up = gate_up[:, inter_pad:inter_pad + inter_dim]
+            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+            w2 = w2_bf16[eid, :, :inter_dim]
+            down = act @ w2.t()
+            wts = topk_weights[token_indices].unsqueeze(-1)
+            expert_wts = mask[token_indices].float().unsqueeze(-1)
+            per_token_wt = (wts * expert_wts).sum(dim=1)
+            output[token_indices] += (per_token_wt * down).to(output.dtype)
+        return output
+
+
 def _swiglustep_moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
@@ -152,17 +227,18 @@ def _swiglustep_moe_forward(
 ) -> torch.Tensor:
     """Unfused MoE forward with swiglustep activation (custom op impl).
 
-    Two execution paths depending on whether we are inside CUDA graph
-    capture:
+    Three execution modes:
 
-    * **Graph-capture path** (fixed shapes, no CPU sync): iterates over
-      ``top_k`` assignments, gathers expert weights for all M tokens per
-      assignment, and accumulates via bmm.  Safe for the decode-sized
-      batch sizes used during capture (M ≤ 512).
+    * **EP mode**: uses the FusedMoE modular kernel's ``_prepare`` /
+      ``_finalize`` for MoRI dispatch/combine, with unfused swiglustep
+      computation on the dispatched local tokens in between.
 
-    * **Eager path** (dynamic shapes OK): iterates over experts, selects
-      the tokens assigned to each expert with ``nonzero``, and runs
-      standard matmul.  Memory-efficient for large-M warmup batches.
+    * **Graph-capture path** (non-EP): iterates over ``top_k``
+      assignments, gathers expert weights for all M tokens per
+      assignment, and accumulates via bmm.
+
+    * **Eager path** (non-EP): iterates over experts, selects tokens
+      via ``nonzero``, and runs standard matmul.
     """
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
@@ -180,61 +256,64 @@ def _swiglustep_moe_forward(
         e_score_correction_bias=self.router_bias,
     )
 
-    M = hidden_states.shape[0]
     limit = self.swiglu_limit
     inter_dim = self._inter_dim
     inter_pad = self._inter_pad
-    x_bf16 = hidden_states.to(torch.bfloat16)
 
-    if torch.cuda.is_current_stream_capturing():
-        # --- Graph-capture path: fixed shapes, loop over top_k ---
-        output = torch.zeros(M, self.hidden_size, dtype=torch.bfloat16,
-                             device=hidden_states.device)
-        for k in range(self.top_k):
-            eids = topk_ids[:, k]  # [M] int32
-            w13_k = self._w13_bf16[eids.long()]  # [M, 2*inter_pad, hidden]
-            gate_up = torch.bmm(
-                w13_k, x_bf16.unsqueeze(2)
-            ).squeeze(2)  # [M, 2*inter_pad]
-            gate = gate_up[:, :inter_dim]
-            up = gate_up[:, inter_pad:inter_pad + inter_dim]
-            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+    if self._use_ep:
+        # --- EP mode: dispatch via modular kernel, unfused local compute ---
+        fused_experts = self.experts.quant_method.fused_experts
+        (
+            dispatch_a1,
+            dispatch_scale,
+            expert_tokens_meta,
+            dispatch_ids,
+            dispatch_weights,
+        ) = fused_experts._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.num_experts,
+            self.experts.expert_mask,
+            False,
+            QuantType.No,
+        )
 
-            w2_k = self._w2_bf16[eids.long(), :, :inter_dim]  # [M, hidden, inter_dim]
-            down = torch.bmm(
-                w2_k, act.unsqueeze(2)
-            ).squeeze(2)  # [M, hidden]
+        context = get_forward_context().context
+        dp_size = get_dp_group().world_size
+        total_valid = context.graph_bs * self.top_k * dp_size
+        if total_valid < dispatch_a1.shape[0] and not context.is_prefill:
+            dispatch_a1 = dispatch_a1[:total_valid]
+            dispatch_ids = dispatch_ids[:total_valid]
+            dispatch_weights = dispatch_weights[:total_valid]
 
-            output += topk_weights[:, k:k + 1] * down
-        return output.to(hidden_states.dtype)
+        x_disp = dispatch_a1.to(torch.bfloat16)
+        local_E = self._w13_bf16.shape[0]
+        disp_ids_2d = dispatch_ids.unsqueeze(1) if dispatch_ids.dim() == 1 else dispatch_ids
+        disp_wts_2d = dispatch_weights.unsqueeze(1) if dispatch_weights.dim() == 1 else dispatch_weights
+
+        fused_out = _swiglustep_unfused_compute(
+            x_disp, disp_wts_2d, disp_ids_2d,
+            self._w13_bf16, self._w2_bf16,
+            local_E, inter_dim, inter_pad,
+            self.hidden_size, limit, self.top_k,
+            hidden_states.dtype,
+        )
+
+        return fused_experts._finalize(
+            None, fused_out, hidden_states,
+            topk_weights, topk_ids, False,
+        )
     else:
-        # --- Eager path: loop over experts, dynamic indexing ---
-        output = torch.zeros(M, self.hidden_size, dtype=hidden_states.dtype,
-                             device=hidden_states.device)
-        for eid in range(self.num_experts):
-            mask = (topk_ids == eid)  # [M, top_k]
-            token_mask = mask.any(dim=1)  # [M]
-            if not token_mask.any():
-                continue
-
-            token_indices = token_mask.nonzero(as_tuple=True)[0]
-            x_sel = x_bf16[token_indices]  # [T_e, hidden]
-
-            w13 = self._w13_bf16[eid]  # [2*inter_pad, hidden]
-            gate_up = x_sel @ w13.t()  # [T_e, 2*inter_pad]
-            gate = gate_up[:, :inter_dim]
-            up = gate_up[:, inter_pad:inter_pad + inter_dim]
-            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
-
-            w2 = self._w2_bf16[eid, :, :inter_dim]  # [hidden, inter_dim]
-            down = act @ w2.t()  # [T_e, hidden]
-
-            wts = topk_weights[token_indices].unsqueeze(-1)  # [T_e, top_k, 1]
-            expert_wts = mask[token_indices].float().unsqueeze(-1)  # [T_e, top_k, 1]
-            per_token_wt = (wts * expert_wts).sum(dim=1)  # [T_e, 1]
-            output[token_indices] += (per_token_wt * down).to(output.dtype)
-
-        return output
+        # --- Non-EP: direct compute on all experts ---
+        x_bf16 = hidden_states.to(torch.bfloat16)
+        return _swiglustep_unfused_compute(
+            x_bf16, topk_weights, topk_ids,
+            self._w13_bf16, self._w2_bf16,
+            self.num_experts, inter_dim, inter_pad,
+            self.hidden_size, limit, self.top_k,
+            hidden_states.dtype,
+        )
 
 
 def _swiglustep_moe_forward_fake(
@@ -276,6 +355,7 @@ class Step3p5MoE(nn.Module):
         self.routed_scaling_factor = config.moe_router_scaling_factor
         self.swiglu_limit = config.get_swiglu_limit(layer_idx)
         self._swiglustep_ready = False
+        self._use_ep = False
 
         # Router gate
         self.gate = ReplicatedLinear(
@@ -322,14 +402,15 @@ class Step3p5MoE(nn.Module):
 
         if self.swiglu_limit > 0:
             self._swiglustep_layer_name = f"{prefix}.swiglustep"
+            self._use_ep = self.experts.use_ep
             atom_config = get_current_atom_config()
             compilation_config = atom_config.compilation_config
             compilation_config.static_forward_context[
                 self._swiglustep_layer_name
             ] = self
             logger.info(
-                "Layer %d: swiglustep enabled (limit=%.1f) for routed experts",
-                layer_idx, self.swiglu_limit,
+                "Layer %d: swiglustep enabled (limit=%.1f, ep=%s) for routed experts",
+                layer_idx, self.swiglu_limit, self._use_ep,
             )
 
     def _prepare_swiglustep_weights(self) -> None:
