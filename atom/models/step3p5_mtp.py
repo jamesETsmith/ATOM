@@ -14,7 +14,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
 from atom.model_config.step3p5 import Step3p5Config
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -105,7 +104,6 @@ class Step3p5MultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
