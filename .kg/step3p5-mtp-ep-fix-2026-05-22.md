@@ -30,10 +30,15 @@ Two fixes applied to unblock MTP startup and EP correctness for Step-3.5-Flash. 
 - **Problem:** `get_layer_attention_config()` and `get_layer_rope_scaling()` indexed `self.layer_types` with MTP layer indices (45-47), causing IndexError when the list only covered 45 main layers (fallback/default case).
 - **Solution:** Bounds check with fallback to `"sliding_attention"` for out-of-range indices.
 
+### Fix 4: MTP double all-reduce on TP>1 (commit 887c340)
+- **Problem:** Step3p5DecoderLayer's dense MLP (non-MoE) uses `RowParallelLinear(reduce_results=True)`, so `down_proj` already does an all-reduce. The MTP layer had an additional explicit `tensor_model_parallel_all_reduce(hidden_states)` after the decoder block, causing hidden states to be 2x the correct value at TP>1.
+- **Solution:** Remove the redundant all-reduce from `Step3p5MultiTokenPredictorLayer.forward()`. Also removed unused import.
+- **Impact:** Fixes MTP output correctness on TP>1 (which is the only practical config since TP=1 OOMs on the model).
+
 ### Current status
 - Code changes committed on branch `add-step3p5-flash`
-- All 402 unit tests pass (excluding 29 pre-existing failures in unrelated tests)
-- All 61 step3p5-specific tests pass
+- All 67 step3p5 unit tests pass (including 6 new MTP bounds tests)
+- All 133 related tests pass
 - **Not yet tested on GPU** — needs MTP startup verification on a node with the model checkpoint
 
 ### Verification plan
