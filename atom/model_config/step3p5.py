@@ -160,7 +160,10 @@ class Step3p5Config(PretrainedConfig):
 
     def get_layer_attention_config(self, layer_idx: int) -> dict:
         """Return attention head config for a given layer index."""
-        layer_type = self.layer_types[layer_idx]
+        if layer_idx < len(self.layer_types):
+            layer_type = self.layer_types[layer_idx]
+        else:
+            layer_type = "sliding_attention"
         if layer_type == "sliding_attention":
             return {
                 "num_attention_heads": self.attention_other_setting[
@@ -199,7 +202,10 @@ class Step3p5Config(PretrainedConfig):
         """
         if self.rope_scaling is None:
             return None
-        layer_type = self.layer_types[layer_idx]
+        if layer_idx < len(self.layer_types):
+            layer_type = self.layer_types[layer_idx]
+        else:
+            layer_type = "sliding_attention"
         if layer_type in self.yarn_only_types:
             return self.rope_scaling
         return None

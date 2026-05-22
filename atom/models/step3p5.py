@@ -148,12 +148,31 @@ def _dequant_fp8_blockscale(
 # ---------------------------------------------------------------------------
 
 
+def _dequant_expert(
+    w_fp8: torch.Tensor,
+    w_scale: torch.Tensor,
+    eid: int,
+) -> torch.Tensor:
+    """Dequantize a single expert's FP8 weight to bf16 on-the-fly.
+
+    Avoids materialising the full [E, …] bf16 tensor — saves ~8.4 GiB
+    per swiglustep MoE layer on TP=1.
+    """
+    return _dequant_fp8_blockscale(
+        _unshuffle_weight(w_fp8[eid]), w_scale[eid]
+    )
+
+
 def _swiglustep_unfused_compute(
     x_bf16: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    w13_bf16: torch.Tensor,
-    w2_bf16: torch.Tensor,
+    w13_fp8: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_bf16: torch.Tensor | None,
+    w2_bf16: torch.Tensor | None,
     num_experts: int,
     inter_dim: int,
     inter_pad: int,
@@ -162,17 +181,18 @@ def _swiglustep_unfused_compute(
     top_k: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Core swiglustep computation on (possibly dispatched) tokens.
+    """Core swiglustep computation.
 
-    Works for both EP and non-EP: expert IDs in ``topk_ids`` must index
-    into ``w13_bf16`` / ``w2_bf16`` directly (local IDs under EP).
+    Two modes depending on whether bf16 buffers are materialised:
+
+    * **Eager (bf16 is None):** dequantizes per-expert on-the-fly.
+      Uses ~20 MiB peak (one expert at a time) instead of ~8.4 GiB.
+    * **Graph capture (bf16 provided):** uses pre-materialised bf16
+      buffers for fast index-gather in fixed-shape chunks.
     """
     M = x_bf16.shape[0]
-    if torch.cuda.is_current_stream_capturing():
-        # Chunked graph-capture path: gathering expert weights for all M
-        # tokens at once (w13_bf16[eids]) creates an [M, 2*inter_pad, H]
-        # tensor that can OOM for large decode batches (e.g. M=512 with
-        # 288 experts → ~10 GiB).  Process in fixed-size chunks instead.
+    if w13_bf16 is not None and w2_bf16 is not None:
+        # Pre-materialised path (graph capture): chunked BMM gather.
         _CHUNK = 64
         output = torch.zeros(M, hidden_size, dtype=torch.bfloat16,
                              device=x_bf16.device)
@@ -197,6 +217,7 @@ def _swiglustep_unfused_compute(
                 output[c_start:c_end] += wts_k[c_start:c_end] * down
         return output.to(out_dtype)
     else:
+        # On-the-fly dequant path (eager / warmup / prefill).
         output = torch.zeros(M, hidden_size, dtype=out_dtype,
                              device=x_bf16.device)
         for eid in range(num_experts):
@@ -206,12 +227,13 @@ def _swiglustep_unfused_compute(
                 continue
             token_indices = token_mask.nonzero(as_tuple=True)[0]
             x_sel = x_bf16[token_indices]
-            w13 = w13_bf16[eid]
+            w13 = _dequant_expert(w13_fp8, w13_scale, eid)
             gate_up = x_sel @ w13.t()
             gate = gate_up[:, :inter_dim]
             up = gate_up[:, inter_pad:inter_pad + inter_dim]
             act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
-            w2 = w2_bf16[eid, :, :inter_dim]
+            w2 = _dequant_expert(w2_fp8, w2_scale, eid)
+            w2 = w2[:, :inter_dim]
             down = act @ w2.t()
             wts = topk_weights[token_indices].unsqueeze(-1)
             expert_wts = mask[token_indices].float().unsqueeze(-1)
@@ -245,6 +267,12 @@ def _swiglustep_moe_forward(
 
     if not self._swiglustep_ready:
         self._prepare_swiglustep_weights()
+
+    # Lazily materialise bf16 buffers for CUDA graph capture.
+    # This happens AFTER warmup/KV-cache sizing so it does not inflate
+    # peak_torch, which is the key to fitting MTP in memory.
+    if torch.cuda.is_current_stream_capturing():
+        self._materialize_swiglustep_bf16()
 
     topk_weights, topk_ids = FusedMoE.select_experts(
         hidden_states=hidden_states,
@@ -288,12 +316,14 @@ def _swiglustep_moe_forward(
             dispatch_weights = dispatch_weights[:total_valid]
 
         x_disp = dispatch_a1.to(torch.bfloat16)
-        local_E = self._w13_bf16.shape[0]
+        local_E = self._w13_fp8.shape[0]
         disp_ids_2d = dispatch_ids.unsqueeze(1) if dispatch_ids.dim() == 1 else dispatch_ids
         disp_wts_2d = dispatch_weights.unsqueeze(1) if dispatch_weights.dim() == 1 else dispatch_weights
 
         fused_out = _swiglustep_unfused_compute(
             x_disp, disp_wts_2d, disp_ids_2d,
+            self._w13_fp8, self._w13_scale,
+            self._w2_fp8, self._w2_scale,
             self._w13_bf16, self._w2_bf16,
             local_E, inter_dim, inter_pad,
             self.hidden_size, limit, self.top_k,
@@ -309,6 +339,8 @@ def _swiglustep_moe_forward(
         x_bf16 = hidden_states.to(torch.bfloat16)
         return _swiglustep_unfused_compute(
             x_bf16, topk_weights, topk_ids,
+            self._w13_fp8, self._w13_scale,
+            self._w2_fp8, self._w2_scale,
             self._w13_bf16, self._w2_bf16,
             self.num_experts, inter_dim, inter_pad,
             self.hidden_size, limit, self.top_k,
@@ -414,38 +446,56 @@ class Step3p5MoE(nn.Module):
             )
 
     def _prepare_swiglustep_weights(self) -> None:
-        """Dequantize FP8 expert weights to bf16 for the unfused swiglustep path.
+        """Store FP8 weight refs and dimensions for on-the-fly dequant.
 
-        Called lazily on first forward when swiglu_limit > 0.
+        The bf16 buffers are NOT materialised here — they are created
+        lazily the first time a CUDA-graph-captured forward runs (via
+        ``_materialize_swiglustep_bf16``).  This keeps warmup memory
+        ~16.9 GiB lower on TP=1, which is essential for MTP.
         """
         layer = self.experts
-        w13_fp8 = layer.w13_weight.data  # [E, 2*inter_pad, hidden]
-        w13_scale = layer.w13_weight_scale.data  # [E, scale_n, scale_k]
-        w2_fp8 = layer.w2_weight.data  # [E, hidden, inter_pad]
-        w2_scale = layer.w2_weight_scale.data  # [E, scale_n, scale_k]
+        self._w13_fp8 = layer.w13_weight.data
+        self._w13_scale = layer.w13_weight_scale.data
+        self._w2_fp8 = layer.w2_weight.data
+        self._w2_scale = layer.w2_weight_scale.data
 
-        E = w13_fp8.shape[0]
-        inter_pad = w13_fp8.shape[1] // 2
-        hidden = w13_fp8.shape[2]
-        self._inter_pad = inter_pad
+        self._inter_pad = self._w13_fp8.shape[1] // 2
         self._inter_dim = layer.intermediate_size_per_partition
 
-        w13_bf16 = torch.empty(E, 2 * inter_pad, hidden, dtype=torch.bfloat16,
-                               device=w13_fp8.device)
-        w2_bf16 = torch.empty(E, hidden, inter_pad, dtype=torch.bfloat16,
-                              device=w2_fp8.device)
+        self._w13_bf16: torch.Tensor | None = None
+        self._w2_bf16: torch.Tensor | None = None
 
+        self._swiglustep_ready = True
+        E = self._w13_fp8.shape[0]
+        logger.info(
+            "Swiglustep ready (on-the-fly dequant): %d experts, "
+            "inter_pad=%d, inter_dim=%d",
+            E, self._inter_pad, self._inter_dim,
+        )
+
+    def _materialize_swiglustep_bf16(self) -> None:
+        """Pre-materialise bf16 expert buffers for CUDA graph capture.
+
+        Called automatically on the first graph-captured forward.
+        """
+        if self._w13_bf16 is not None:
+            return
+        E = self._w13_fp8.shape[0]
+        inter_pad = self._inter_pad
+        hidden = self._w13_fp8.shape[2]
+        w13_bf16 = torch.empty(E, 2 * inter_pad, hidden,
+                               dtype=torch.bfloat16,
+                               device=self._w13_fp8.device)
+        w2_bf16 = torch.empty(E, hidden, inter_pad,
+                              dtype=torch.bfloat16,
+                              device=self._w2_fp8.device)
         for e in range(E):
-            w13_unshuf = _unshuffle_weight(w13_fp8[e])
-            w2_unshuf = _unshuffle_weight(w2_fp8[e])
-            w13_bf16[e] = _dequant_fp8_blockscale(w13_unshuf, w13_scale[e])
-            w2_bf16[e] = _dequant_fp8_blockscale(w2_unshuf, w2_scale[e])
-
+            w13_bf16[e] = _dequant_expert(self._w13_fp8, self._w13_scale, e)
+            w2_bf16[e] = _dequant_expert(self._w2_fp8, self._w2_scale, e)
         self._w13_bf16 = w13_bf16
         self._w2_bf16 = w2_bf16
-        self._swiglustep_ready = True
-        logger.info("Swiglustep weights dequantized: w13=%s, w2=%s",
-                    list(w13_bf16.shape), list(w2_bf16.shape))
+        logger.info("Swiglustep bf16 materialised for graph capture: "
+                    "w13=%s, w2=%s", list(w13_bf16.shape), list(w2_bf16.shape))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Router logits in FP32
