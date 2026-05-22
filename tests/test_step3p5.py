@@ -620,3 +620,42 @@ class TestMTPRegistration:
             content = f.read()
         assert '"Step3p5MTPModel"' in content
         assert "atom.models.step3p5_mtp.Step3p5MTP" in content
+
+
+# ---------------------------------------------------------------------------
+# MTP layer bounds safety
+# ---------------------------------------------------------------------------
+
+
+class TestMTPLayerBoundsSafety:
+    """Ensure config methods handle MTP layer indices (≥ num_hidden_layers)
+    without IndexError."""
+
+    def test_get_layer_attention_config_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            attn_cfg = config.get_layer_attention_config(idx)
+            assert attn_cfg["num_attention_heads"] == 96
+            assert attn_cfg["sliding_window"] == 512
+
+    def test_get_layer_rope_scaling_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            scaling = config.get_layer_rope_scaling(idx)
+            assert scaling is None
+
+    def test_get_layer_rope_theta_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            theta = config.get_layer_rope_theta(idx)
+            assert isinstance(theta, float)
+
+    def test_get_layer_partial_rotary_factor_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            factor = config.get_layer_partial_rotary_factor(idx)
+            assert isinstance(factor, float)
+
+    def test_is_moe_layer_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            assert config.is_moe_layer(idx) is False
+
+    def test_get_swiglu_limit_mtp_index(self, config):
+        for idx in [45, 46, 47]:
+            assert config.get_swiglu_limit(idx) == 0.0
