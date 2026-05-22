@@ -320,6 +320,13 @@ def _swiglustep_moe_forward(
         disp_ids_2d = dispatch_ids.unsqueeze(1) if dispatch_ids.dim() == 1 else dispatch_ids
         disp_wts_2d = dispatch_weights.unsqueeze(1) if dispatch_weights.dim() == 1 else dispatch_weights
 
+        # Remap global expert IDs → local indices.  MoRI dispatch
+        # returns global IDs but local weight tensors are sized
+        # [local_E, ...], so we must translate before indexing.
+        expert_map = self.experts.expert_map  # [global_E] → local or -1
+        if expert_map is not None:
+            disp_ids_2d = expert_map[disp_ids_2d.long()].to(disp_ids_2d.dtype)
+
         fused_out = _swiglustep_unfused_compute(
             x_disp, disp_wts_2d, disp_ids_2d,
             self._w13_fp8, self._w13_scale,
