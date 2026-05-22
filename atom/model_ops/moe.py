@@ -80,8 +80,10 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+        # Use mori all2all kernels when expert parallel is enabled.
+        # Pure EP (dp_size=1, ep_size>1) still needs MoRI for all-to-all
+        # dispatch; the previous dp_size>1 gate incorrectly blocked this.
+        return self.use_ep and _has_module("mori")
 
     @property
     def use_mori_kernels(self):

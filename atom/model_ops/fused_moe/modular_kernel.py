@@ -10,7 +10,6 @@ from typing import Callable, Optional, final
 from enum import Enum
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import fused_moe
-from aiter.dist.parallel_state import get_dp_group
 
 
 class FusedMoEActivationFormat(Enum):
@@ -331,12 +330,14 @@ class FusedMoEModularKernel(torch.nn.Module):
 
         # optimize fused_moe hidden_states
         # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
-        # but actual valid tokens = graph_bs * topk * dp_size
+        # but actual valid tokens = graph_bs * topk * num_dispatchers
         context = get_forward_context().context
-        dp_size = get_dp_group().world_size
+        # Use num_dispatchers (= ep_size) instead of dp_size so that pure EP
+        # (dp_size=1, ep_size>1) does not discard dispatched tokens.
+        num_dispatchers = self.prepare_finalize.num_dispatchers()
         topk = topk_ids.shape[1]
         # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
-        total_valid_tokens = context.graph_bs * topk * dp_size
+        total_valid_tokens = context.graph_bs * topk * num_dispatchers
         if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
             dispatch_a1 = dispatch_a1[:total_valid_tokens]
             dispatch_ids = dispatch_ids[:total_valid_tokens]

@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from aiter import QuantType
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
-    get_dp_group,
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
@@ -308,8 +307,8 @@ def _swiglustep_moe_forward(
         )
 
         context = get_forward_context().context
-        dp_size = get_dp_group().world_size
-        total_valid = context.graph_bs * self.top_k * dp_size
+        num_dispatchers = fused_experts.prepare_finalize.num_dispatchers()
+        total_valid = context.graph_bs * self.top_k * num_dispatchers
         if total_valid < dispatch_a1.shape[0] and not context.is_prefill:
             dispatch_a1 = dispatch_a1[:total_valid]
             dispatch_ids = dispatch_ids[:total_valid]
