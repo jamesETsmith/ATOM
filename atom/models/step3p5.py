@@ -712,6 +712,7 @@ class Step3p5DecoderLayer(nn.Module):
                 prefix=f"{prefix}.moe",
                 layer_idx=layer_idx,
             )
+            self.ep_enabled = self.moe.experts.use_ep
             swiglu_limit_shared = config.get_swiglu_limit_shared(layer_idx)
             self.share_expert = Step3p5MLP(
                 hidden_size=config.hidden_size,
@@ -726,6 +727,7 @@ class Step3p5DecoderLayer(nn.Module):
         else:
             self.moe = None
             self.share_expert = None
+            self.ep_enabled = False
             self.mlp = Step3p5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -771,11 +773,17 @@ class Step3p5DecoderLayer(nn.Module):
         if self.is_moe:
             routed = self.moe(hidden_states)
             shared = self.share_expert(hidden_states)
-            hidden_states = routed + shared
             if self.tp_size > 1:
-                hidden_states = tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                if self.ep_enabled:
+                    shared = tensor_model_parallel_all_reduce(shared)
+                    hidden_states = routed + shared
+                else:
+                    hidden_states = routed + shared
+                    hidden_states = tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
+            else:
+                hidden_states = routed + shared
         else:
             hidden_states = self.mlp(hidden_states)
 

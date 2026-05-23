@@ -370,7 +370,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             output,
             fused_out,
             hidden_states,
-            topk_weights,
-            topk_ids,
+            dispatch_weights,
+            dispatch_ids,
             apply_router_weight_on_input,
         )

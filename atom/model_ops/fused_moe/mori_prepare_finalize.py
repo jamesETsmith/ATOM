@@ -186,14 +186,13 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        self._num_input_tokens = a1.shape[0]
         scale = None
         if self.use_fp8_dispatch:
             from aiter import get_hip_quant
 
             quant_func = get_hip_quant(quant_type)
             a1, scale = quant_func(a1, quant_dtype=dtypes.fp8)
-
-        block_num, warp_per_block = self._get_dispatch_config()
 
         (
             dispatch_a1,
@@ -202,7 +201,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_ids,
             dispatch_recv_token_num,
         ) = self._sync_mori_op.dispatch(
-            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+            a1, topk_weights, scale, topk_ids,
         )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
@@ -225,16 +224,12 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
     ) -> torch.Tensor:
-        num_token = topk_ids.shape[0]
-
-        block_num, warp_per_block = self._get_dispatch_config()
+        num_token = self._num_input_tokens
 
         result = self._sync_mori_op.combine(
             fused_expert_output,
             None,
             topk_ids,
-            block_num,
-            warp_per_block,
         )[0]
         return result[:num_token]
 
@@ -252,6 +247,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert (
             not apply_router_weight_on_input
         ), "mori does not support apply_router_weight_on_input=True now."
+        self._num_input_tokens = a1.shape[0]
 
         scale = None
         if self.use_fp8_dispatch:
@@ -340,7 +336,8 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             dispatch_ids,
             dispatch_recv_token_num,
         ) = mori_op.dispatch(
-            a1, topk_weights, scale, topk_ids, block_num, warp_per_block
+            a1, topk_weights, scale, topk_ids,
+            block_num=block_num, warp_per_block=warp_per_block,
         )
 
         tbo_switch_to_compute_sync()
@@ -368,7 +365,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
     ) -> Callable:
-        num_token = topk_ids.shape[0]
+        num_token = self._num_input_tokens
         if self._low_latency:
             return self._finalize_async_ll(num_token, fused_expert_output, topk_ids)
         return self._finalize_async_comm_stream(
@@ -425,8 +422,7 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             fused_expert_output,
             None,
             topk_ids,
-            block_num,
-            warp_per_block,
+            block_num=block_num, warp_per_block=warp_per_block,
         )[0]
 
         tbo_switch_to_compute_sync()
