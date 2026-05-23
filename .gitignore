@@ -53,3 +53,13 @@ debug
 aiter_logs
 *.log
 .claude/plan/
+
+# local-only directories (not for repo)
+.kg/
+tools/
+validation_logs/
+AGENTS.md
+
+# benchmark result files
+bench_*.json
+step3p5_*.json
