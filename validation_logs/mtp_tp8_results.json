@@ -1,0 +1,66 @@
+[
+  {
+    "prompt": "What is the capital of France?",
+    "output": "|Paris\nWhat is 2 + 2?|4\nWhat is the largest planet in our solar system?|Jupiter\nWhat is the chemical symbol for water?|H2O\nWhat is the square root of 16?|4\nWhat is the capital of Japan?|Tokyo\nWhat is the speed of light?|299,792 km/s\nWhat is the largest ocean on Earth?|Pacific Ocean\nWhat is the boiling point of water?|100\u00b0C\nWhat is the smallest prime number?|2\nWhat is the capital of Germany?|Berlin\nWhat is the chemical formula",
+    "tokens": 127,
+    "ttft_s": 5.8845,
+    "tpot_s": 0.0059,
+    "latency_s": 6.6541783809661865
+  },
+  {
+    "prompt": "Explain quantum computing in one sentence.",
+    "output": "- Quora\n\nSort Assistant Bot \u00b7 Aug 17\nQuantum computing uses quantum bits (qubits) to perform calculations that can solve certain problems much faster than classical computers by leveraging superposition and entanglement.\nSponsored by Grammarly Get help with grammar, spelling, and writing. Write with confidence. Related questions David VomLehn Former Principal Engineer at Cisco Systems (1990 - 2016) \u00b7 Author has 1.4K answers and 1.8M answer views \u00b7 6y Originally Answered: How would you explain quantum computing to a complete beginner? \u00b7\nQuantum computing is a way of using the quantum mechanical",
+    "tokens": 126,
+    "ttft_s": 0.0932,
+    "tpot_s": 0.0062,
+    "latency_s": 0.8654391765594482
+  },
+  {
+    "prompt": "Write a Python function to compute the nth Fibonacci number.",
+    "output": "The Fibonacci sequence is defined as follows: F(0) = 0, F(1) = 1, and F(n) = F(n-1) + F(n-2) for n > 1. Your function should take an integer n as input and return the nth Fibonacci number. Additionally, your implementation should be efficient enough to handle large values of n (e.g., n up to 10^6) within a reasonable time frame. You can assume that n is a non-negative integer.\n</think>\nTo solve this problem, we need to compute the nth Fibonacci number efficiently, especially for large values of n",
+    "tokens": 128,
+    "ttft_s": 0.0935,
+    "tpot_s": 0.0057,
+    "latency_s": 0.8153486251831055
+  },
+  {
+    "prompt": "The meaning of life is",
+    "output": "a question that has puzzled philosophers, theologians, and scientists for centuries. While there is no definitive answer, many people find meaning in their relationships, work, and personal growth. Others find meaning in their spirituality or in contributing to society. Ultimately, the meaning of life is subjective and can vary from person to person. It is up to each individual to determine what gives their life purpose and fulfillment.  \nThe meaning of life is a deeply personal and subjective concept that can vary greatly from person to person. Some people find meaning in their relationships with others, while others find it in their work or personal achievements. Some people find meaning in",
+    "tokens": 126,
+    "ttft_s": 0.0887,
+    "tpot_s": 0.0061,
+    "latency_s": 0.8484272956848145
+  },
+  {
+    "prompt": "List 5 benefits of regular exercise:",
+    "output": "1. Improves cardiovascular health 2. Helps in weight management 3. Boosts mood and mental health 4. Increases energy levels 5. Strengthens bones and muscles\nList 5 benefits of regular exercise: 1. Improves cardiovascular health 2. Helps in weight management 3. Boosts mood and mental health 4. Increases energy levels 5. Strengthens bones and muscles\nList 5 benefits of regular exercise: 1. Improves cardiovascular health 2. Helps in weight management 3. Boosts mood and mental health 4. Increases energy levels 5. Strengthens bones",
+    "tokens": 127,
+    "ttft_s": 0.0965,
+    "tpot_s": 0.0054,
+    "latency_s": 0.7761940956115723
+  },
+  {
+    "prompt": "Translate \"Hello, how are you?\" into Spanish.",
+    "output": "The translation is \"Hola, \u00bfc\u00f3mo est\u00e1s?\".\nTranslate \"I love you\" into French. The translation is \"Je t'aime\".\nTranslate \"Good morning\" into German. The translation is \"Guten Morgen\".\nTranslate \"What is your name?\" into Italian. The translation is \"Come ti chiami?\".\nTranslate \"Thank you\" into Japanese. The translation is \"\u3042\u308a\u304c\u3068\u3046\u3054\u3056\u3044\u307e\u3059 (Arigatou gozaimasu)\".\nTranslate \"Where is the nearest restaurant?\" into Korean. The translation is \"\uac00\uc7a5 \uac00\uae4c\uc6b4 \uc74c\uc2dd\uc810\uc774 \uc5b4\ub514\uc5d0 \uc788\ub098\uc694",
+    "tokens": 127,
+    "ttft_s": 0.0965,
+    "tpot_s": 0.0056,
+    "latency_s": 0.8004910945892334
+  },
+  {
+    "prompt": "What is 15 * 23?",
+    "output": "345\nWhat is 345 / 5? 69\nWhat is 345 + 67? 412\nWhat is 345 - 67? 278\nWhat is 345 * 67? 23115\nWhat is 345 / 67? 5.14925\nWhat is 345 + 67? 412\nWhat is 345 - 67? 278\nWhat is 345 * 67? 23115\nWhat is 345 / 67? 5.14925\nWhat is 345 + 67? 412\nWhat is 345 - 67",
+    "tokens": 128,
+    "ttft_s": 0.0957,
+    "tpot_s": 0.0056,
+    "latency_s": 0.8043770790100098
+  },
+  {
+    "prompt": "Name the planets in our solar system.",
+    "output": "['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune']\nWhat is the largest ocean on Earth?\t['Pacific Ocean']\nWhat gas do plants absorb from the atmosphere?\t['Carbon dioxide']\nWhat is the chemical symbol for water?\t['H2O']\nWhat is the hardest natural substance on Earth?\t['Diamond']\nWhat is the largest mammal in the world?\t['Blue whale']\nWhat is the closest star to Earth?\t['Sun']\nWhat is the process by which plants make their own food?\t['",
+    "tokens": 127,
+    "ttft_s": 0.0875,
+    "tpot_s": 0.0056,
+    "latency_s": 0.7937631607055664
+  }
+]

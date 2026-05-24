@@ -1,0 +1,5 @@
+EP TP=4: OOM during weight creation (model too large for 4 GPUs)
+EP TP=8: OOM during weight creation (EP doubles MoE weight memory, 94%->188%)
+Root cause: Step-3.5-Flash-FP8 uses 240GB/GPU at TP=8 (93.7%). EP requires all experts on each GPU.
+This is a hardware limitation on 8x MI325X (256GB), not a code bug.
+EP code fix (global->local expert ID remapping) is correct but cannot be validated without larger GPUs or smaller model.
