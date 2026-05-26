@@ -51,6 +51,13 @@ def main() -> int:
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--num-experts", type=int, default=288)
     parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument(
+        "--warp-per-block",
+        type=int,
+        default=16,
+        help="MoRI warp_num_per_block. PR #286 says 16 hangs on gfx942; use 4.",
+    )
+    parser.add_argument("--block-num", type=int, default=80)
     args = parser.parse_args()
 
     dist.init_process_group(backend="gloo")
@@ -95,8 +102,8 @@ def main() -> int:
         max_num_inp_token_per_rank=args.tokens_per_rank,
         num_experts_per_rank=local_experts,
         num_experts_per_token=args.topk,
-        warp_num_per_block=16,
-        block_num=80,
+        warp_num_per_block=args.warp_per_block,
+        block_num=args.block_num,
         kernel_type=kernel_type,
         rdma_block_num=0,
         gpu_per_node=8,
