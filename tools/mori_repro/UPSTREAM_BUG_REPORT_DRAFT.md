@@ -67,6 +67,10 @@ This is consistent with the threshold being at a specific hidden size (around 20
 - Smaller `block_num` (64)
 - Reducing `max_num_inp_token_per_rank` (tested 1024–16384; all hang at hidden=4096+)
 - Moving MoRI to a dedicated CUDA stream (causes HIP error 709 separately)
+- `--all2all-backend low-latency` (AsyncLL) — server still hangs in same warmup path
+- **TP=4 + EP=4** (SGLang's documented Step-3.5 config, 72 experts/GPU, N=1280) — server hangs in same warmup path. Rules out the "N=320 CK GEMM incompatibility" hypothesis as the cause of *this* hang.
+- `MORI_DISABLE_P2P=ON` — incompatible with our `bnxt_re*` NIC stack (MoRI's topology probe crashes on them, so they are in the exclude list; with P2P off MoRI asserts "no rdma device found").
+- `AITER_ONLINE_TUNE=1` — tuner subprocess pool is incompatible with ATOM's multiprocess engine setup (`KeyError` on rank PID), wedges before any tuning happens.
 
 ## What we want from MoRI maintainers
 
