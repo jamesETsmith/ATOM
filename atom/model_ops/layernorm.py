@@ -15,7 +15,11 @@ from aiter import (
 from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
+
+try:
+    from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
+except (ImportError, ModuleNotFoundError):
+    gated_rmsnorm_fp8_group_quant = None
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
