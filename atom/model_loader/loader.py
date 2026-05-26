@@ -492,9 +492,11 @@ def load_model(
                                 continue
 
                             # Generic call - model provides implementation details
-                            num_experts = getattr(
-                                hf_config, "n_routed_experts", 0
-                            ) or getattr(hf_config, "num_experts", 0)
+                            num_experts = (
+                                getattr(hf_config, "n_routed_experts", 0)
+                                or getattr(hf_config, "num_experts", 0)
+                                or getattr(hf_config, "moe_num_experts", 0)
+                            )
                             matched = load_fused_expert_weights_fn(
                                 name,  # Original checkpoint name
                                 name_mapped,  # Mapped parameter name
@@ -505,7 +507,13 @@ def load_model(
                             )
 
                             if matched:
+                                # Record both the ckpt-side and model-side
+                                # names so the unloaded-params check (which
+                                # compares against `params_dict` keys) sees
+                                # `experts.w13_weight` as loaded after a
+                                # fused stacked tensor is unpacked.
                                 loaded_weights_record.add(prefix + name)
+                                loaded_weights_record.add(prefix + name_mapped)
                                 break
 
                         if matched:

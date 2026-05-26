@@ -1508,27 +1508,26 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_n = 1
                 block_k = 32
             tp_size = get_tp_group().world_size
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
+            # Pad intermediate_size_per_partition up to a block_n multiple so
+            # block-wise weights and scales align with CK kernel requirements.
+            # Required when inter / tp_size is not block-aligned (e.g.
+            # Step-3.5-Flash inter=1280 with tp=8 -> 160 per rank, padded to 256).
+            # The padded tail is zeroed at allocation and the weight scale
+            # tensors already use ceil-div sizing further below.
+            padded_inter = (
+                (intermediate_size_per_partition + block_n - 1) // block_n * block_n
+            )
+            if tp_size > 1 and padded_inter % block_k != 0:
                 raise ValueError(
                     f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"{padded_inter} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
+            intermediate_size_per_partition = padded_inter
 
         # WEIGHTS
         w13_weight = atom_parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size,
@@ -1539,7 +1538,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
         w2_weight = atom_parameter(
-            torch.empty(
+            torch.zeros(
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition,
@@ -1720,12 +1719,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 per_act_token_quant=True,
             )
         else:
+            if self.quant_type == QuantType.per_1x128:
+                block_shape = [128, 128]
+            elif self.quant_type == QuantType.per_1x32:
+                block_shape = [1, 32]
+            else:
+                block_shape = None
             return fp8_w8a8_moe_quant_config(
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                block_shape=None,
+                block_shape=block_shape,
             )
 
     @mark_trace(prefix="fp8_moe", torch_compile=False)
@@ -2288,6 +2293,31 @@ class FusedMoE(torch.nn.Module):
     def use_ep(self):
         return self.moe_parallel_config.use_ep
 
+    def _compute_tp_shard_range(
+        self, loaded_dim_size: int, tp_rank: int
+    ) -> tuple[int, int]:
+        """Return (start, size) for narrowing a loaded tensor on the shard dim.
+
+        Two cases:
+        * Weight tensor (`loaded == inter * tp_size`): even split into
+          `tp_size` chunks of size `loaded // tp_size`.
+        * Block-quant scale tensor (`loaded < inter * tp_size`, one entry per
+          block): rank k owns weight rows `[k*inter, (k+1)*inter)`; return the
+          scale-block range that covers those rows. Needed for FP8 block quant
+          when `intermediate_size_per_partition` is not a multiple of `block_n`
+          (e.g. Step-3.5-Flash inter=1280, tp=8 -> 160 per rank, block_n=128).
+        """
+        expected_full = self.intermediate_size_per_partition * self.tp_size
+        if loaded_dim_size >= expected_full:
+            size = loaded_dim_size // self.tp_size
+            return size * tp_rank, size
+        block_size = (expected_full + loaded_dim_size - 1) // loaded_dim_size
+        row_start = tp_rank * self.intermediate_size_per_partition
+        row_end = row_start + self.intermediate_size_per_partition
+        start = row_start // block_size
+        end = min((row_end + block_size - 1) // block_size, loaded_dim_size)
+        return start, end - start
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -2441,14 +2471,15 @@ class FusedMoE(torch.nn.Module):
             return
 
         # Index the loaded weight for tp sharding.
-        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim.
+        # Use _compute_tp_shard_range to handle both padded weights (e.g.
+        # MXFP4 alignment) and block-quant scale tensors whose block count
+        # does not divide evenly across TP ranks (e.g. FP8 Step-3.5 tp=8).
         expert_shard_size = expert_data.shape[shard_dim] // 2
-        # Derive shard size from loaded_weight (unpadded checkpoint) to avoid
-        # out-of-bounds when expert_data is padded (e.g. MXFP4 alignment).
-        load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, load_shard_size * tp_rank, load_shard_size
+        start, load_shard_size = self._compute_tp_shard_range(
+            loaded_weight.shape[shard_dim], tp_rank
         )
+        loaded_weight = loaded_weight.narrow(shard_dim, start, load_shard_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -2498,13 +2529,13 @@ class FusedMoE(torch.nn.Module):
             return
 
         # Index the loaded weight for tp sharding.
-        # down_proj: "RowParallel" so tp sharding on input_dim
-        # Narrow parameter and load.
+        # down_proj: "RowParallel" so tp sharding on input_dim.
+        # Use _compute_tp_shard_range (see _load_w13).
         shard_size = expert_data.shape[shard_dim]
-        load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, load_shard_size * tp_rank, load_shard_size
+        start, load_shard_size = self._compute_tp_shard_range(
+            loaded_weight.shape[shard_dim], tp_rank
         )
+        loaded_weight = loaded_weight.narrow(shard_dim, start, load_shard_size)
         if load_shard_size != shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.

@@ -318,6 +318,24 @@ class Step3p5MoE(nn.Module):
             config=config,
         )
 
+        # The swiglustep custom forward does its own per-rank expert matmuls
+        # against ``self._w13_bf16[eid]`` and therefore assumes every rank
+        # holds every expert.  With expert parallelism each rank only owns
+        # a slice of the experts (``local_num_experts < num_experts``) and
+        # needs cross-rank dispatch, which this code path does not implement.
+        # Disable the custom path under EP and fall back to the standard
+        # ``FusedMoE.forward_impl`` (which loses the swiglu clamp on the
+        # two layers that have a non-zero limit, but is functionally
+        # correct end-to-end).
+        if self.swiglu_limit > 0 and self.experts.use_ep:
+            logger.warning(
+                "Layer %d: swiglustep clamp disabled because expert "
+                "parallel is enabled; falling back to standard FusedMoE "
+                "(swiglu_limit=%.1f will be ignored on this layer).",
+                layer_idx,
+                self.swiglu_limit,
+            )
+            self.swiglu_limit = 0
         if self.swiglu_limit > 0:
             self._swiglustep_layer_name = f"{prefix}.swiglustep"
             atom_config = get_current_atom_config()
@@ -798,7 +816,12 @@ class Step3p5ForCausalLM(nn.Module):
 
     @staticmethod
     def detect_fused_expert_format(weight_name: str) -> bool:
-        """Return True if *weight_name* is a stacked expert tensor."""
+        """Return True if *weight_name* is a stacked expert tensor.
+
+        Matches both the FP8 weight tensors (``.weight``) and their
+        block-quant scale tensors (``.weight_scale_inv``) so the loader
+        unpacks both through the fused-expert path.
+        """
         return (
             ".moe.gate_proj" in weight_name
             or ".moe.up_proj" in weight_name
@@ -807,7 +830,16 @@ class Step3p5ForCausalLM(nn.Module):
 
     @staticmethod
     def get_fused_expert_mapping() -> list[tuple[str, str, str]]:
+        # (param_name_fragment, ckpt_weight_name_fragment, shard_id)
+        # The loader normalizes ``weight_scale_inv`` → ``weight_scale`` before
+        # calling into here (see ``atom/model_loader/loader.py``), so the scale
+        # entries below must match the normalized form ``.weight_scale``.
+        # Order matters: ``.weight`` is a substring of ``.weight_scale``, so
+        # the more specific scale entries must be checked first.
         return [
+            ("moe.experts.w13_weight_scale", "moe.gate_proj.weight_scale", "w1"),
+            ("moe.experts.w13_weight_scale", "moe.up_proj.weight_scale", "w3"),
+            ("moe.experts.w2_weight_scale", "moe.down_proj.weight_scale", "w2"),
             ("moe.experts.w13_weight", "moe.gate_proj.weight", "w1"),
             ("moe.experts.w13_weight", "moe.up_proj.weight", "w3"),
             ("moe.experts.w2_weight", "moe.down_proj.weight", "w2"),
@@ -822,7 +854,13 @@ class Step3p5ForCausalLM(nn.Module):
         shard_id: str,
         num_experts: int,
     ) -> bool:
-        """Unpack a stacked [num_experts, ...] tensor into per-expert slots."""
+        """Unpack a stacked [num_experts, ...] tensor into per-expert slots.
+
+        The per-rank intermediate size must be block-aligned for FP8
+        block-quant.  On AMD with this model, use ``--tp 8
+        --enable-expert-parallel`` so each rank holds whole experts at the
+        un-split intermediate size (1280), keeping block alignment intact.
+        """
         if name not in params_dict:
             return False
         param = params_dict[name]
