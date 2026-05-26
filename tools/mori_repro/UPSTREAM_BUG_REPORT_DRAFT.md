@@ -73,3 +73,13 @@ This is consistent with the threshold being at a specific hidden size (around 20
 1. Confirm that this is a known issue or reproduces on your test rig at hidden=4096+.
 2. Guidance on whether `MORI_DISABLE_TOPO=1` is supposed to be safe — if it changes heap layout, that may be the root cause.
 3. Either a fix or a documented `max_hidden_dim` for IntraNode dispatch on gfx942.
+
+## Related issues (apparent prior art / sibling failures)
+
+- **[ROCm/mori#210](https://github.com/ROCm/mori/issues/210)** — `EpDispatchCombineOp` SIGSEGV/OOM at exactly the same `hidden_dim=7168`, 256 experts, top-8 shape on MI355X with sglang-0.5.9-rocm720 + mori-0227-2. The reporter's `MORI_SHMEM_HEAP_SIZE` workaround does not apply directly to our deadlock symptom, but the shape/regime is identical. **Closest match.**
+- **[ROCm/mori#168](https://github.com/ROCm/mori/issues/168)** — MoRI-EP **internode** dispatch hang on MI300X+CX7 with assertion `lanePe < worldSize`. Different transport but same dispatch-kernel-hang failure class.
+- **[ROCm/mori#276](https://github.com/ROCm/mori/issues/276)** — Documents `MORI_DISABLE_P2P=ON` as a known workaround for intranode P2P routing issues on rail-optimized fabrics. (Untested here; worth trying.)
+- **[ROCm/aiter#346](https://github.com/ROCm/aiter/issues/346)** — `test_moe.py` stuck at `hidden_dim=8192` on MI308X. Same "stuck at specific large hidden_dim" signature for AITER MoE kernels. Open since Apr 2025.
+- **[vllm-project/vllm#43547](https://github.com/vllm-project/vllm/issues/43547)** — Different EP backend (`allgather_reducescatter`) but the same structural failure: divergent collective on one rank → TP peers deadlock. Validates that this class of bug is recognized across MoE EP backends.
+
+Our standalone repro at `hidden_dim>=4096` with pure dispatch+combine (no concurrent allreduce, no NCCL, no compute) appears to isolate the bug more cleanly than the existing reports and may be useful to attach to mori#210.
