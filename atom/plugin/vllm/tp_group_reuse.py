@@ -116,11 +116,21 @@ def init_aiter_tp_from_vllm(tensor_model_parallel_size: int) -> bool:
 
         from aiter.dist.parallel_state import set_custom_all_reduce
 
-        set_custom_all_reduce(True)
+        # ATOM_DISABLE_CUSTOM_AR=1 falls back to PyNcclCommunicator (RCCL).
+        # Useful when CustomAllreduce IPC buffers conflict with MoRI shmem
+        # (see ROCm/aiter#2061) or to bisect EP hangs.
+        import os as _os
+
+        _disable_ca = _os.environ.get("ATOM_DISABLE_CUSTOM_AR", "0") == "1"
+        set_custom_all_reduce(not _disable_ca)
 
         logger.info(
-            "ATOM plugin: reused vLLM TP group with aiter ca_comm "
-            "(single IPC init, no duplicate ProcessGroups)"
+            "ATOM plugin: reused vLLM TP group with aiter %s",
+            (
+                "PyNCCL (custom AR disabled via ATOM_DISABLE_CUSTOM_AR=1)"
+                if _disable_ca
+                else "ca_comm (single IPC init, no duplicate ProcessGroups)"
+            ),
         )
         return True
     except Exception as e:

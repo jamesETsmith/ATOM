@@ -13,7 +13,6 @@ Run with:
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 
@@ -28,20 +27,36 @@ def log(rank: int, msg: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iters", type=int, default=45,
-                        help="Number of back-to-back dispatch/combine cycles")
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=45,
+        help="Number of back-to-back dispatch/combine cycles",
+    )
     parser.add_argument("--tokens-per-rank", type=int, default=16384)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--num-experts", type=int, default=288)
     parser.add_argument("--topk", type=int, default=8)
-    parser.add_argument("--sync-every", type=int, default=0,
-                        help="If >0, torch.cuda.synchronize() after this many iters")
-    parser.add_argument("--call-reset", action="store_true",
-                        help="Pass call_reset=True to combine()")
-    parser.add_argument("--final-sync-only", action="store_true",
-                        help="Only sync at the end (mimics layers 3-42 pattern)")
-    parser.add_argument("--swiglu-sync-at", type=int, default=-1,
-                        help="Iter index at which to do an .item() sync mid-loop (mimics layer 43)")
+    parser.add_argument(
+        "--sync-every",
+        type=int,
+        default=0,
+        help="If >0, torch.cuda.synchronize() after this many iters",
+    )
+    parser.add_argument(
+        "--call-reset", action="store_true", help="Pass call_reset=True to combine()"
+    )
+    parser.add_argument(
+        "--final-sync-only",
+        action="store_true",
+        help="Only sync at the end (mimics layers 3-42 pattern)",
+    )
+    parser.add_argument(
+        "--swiglu-sync-at",
+        type=int,
+        default=-1,
+        help="Iter index at which to do an .item() sync mid-loop (mimics layer 43)",
+    )
     args = parser.parse_args()
 
     # ---- Distributed init (gloo for CPU shmem bootstrap) -----------------
@@ -52,6 +67,7 @@ def main() -> int:
 
     # MoRI requires "mori" process group registration + shmem init
     import mori
+
     torch._C._distributed_c10d._register_process_group("mori", dist.group.WORLD)
     mori.shmem.shmem_torch_process_group_init("mori")
     log(rank, f"shmem init done, world={world_size}")
@@ -76,8 +92,11 @@ def main() -> int:
         gpu_per_node=8,
     )
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
-    log(rank, f"mori_op created: local_experts={local_experts}, "
-              f"topk={args.topk}, tokens={args.tokens_per_rank}")
+    log(
+        rank,
+        f"mori_op created: local_experts={local_experts}, "
+        f"topk={args.topk}, tokens={args.tokens_per_rank}",
+    )
 
     # ---- Build random input ----------------------------------------------
     M = args.tokens_per_rank
@@ -86,10 +105,10 @@ def main() -> int:
     x = torch.randn(M, H, device="cuda", dtype=torch.bfloat16)
 
     # Random topk routing
-    topk_ids = torch.randint(0, args.num_experts, (M, args.topk),
-                             device="cuda", dtype=torch.int32)
-    topk_weights = torch.rand(M, args.topk, device="cuda",
-                              dtype=torch.float32)
+    topk_ids = torch.randint(
+        0, args.num_experts, (M, args.topk), device="cuda", dtype=torch.int32
+    )
+    topk_weights = torch.rand(M, args.topk, device="cuda", dtype=torch.float32)
 
     # Dummy empty scales (fp16 path → scales unused)
     scales = torch.empty(0, device="cuda", dtype=torch.float32)
@@ -114,13 +133,17 @@ def main() -> int:
         # Mimic swiglustep layer 43 mid-loop sync
         if i == args.swiglu_sync_at:
             log(rank, f"iter {i}: swiglustep-style .any() sync ENTER")
-            mask = (disp_ids == 0).any() if disp_ids.numel() > 0 else torch.tensor(False, device="cuda")
+            mask = (
+                (disp_ids == 0).any()
+                if disp_ids.numel() > 0
+                else torch.tensor(False, device="cuda")
+            )
             r = mask.item()
             log(rank, f"iter {i}: swiglustep-style .any() sync DONE, result={r}")
 
         # COMBINE (back to caller)
         try:
-            combine_out = mori_op.combine(
+            mori_op.combine(
                 fake_out,
                 None,
                 disp_ids,

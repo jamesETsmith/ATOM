@@ -537,6 +537,14 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        # ATOM_DISABLE_CUSTOM_AR=1 forces PyNCCL (RCCL) instead of AITER
+        # CustomAllreduce. Workaround for MoRI shmem heap / custom AR IPC
+        # buffer interaction (see ROCm/aiter#2061) that can deadlock EP runs.
+        if os.environ.get("ATOM_DISABLE_CUSTOM_AR", "0") == "1":
+            from aiter.dist.parallel_state import set_custom_all_reduce
+
+            set_custom_all_reduce(False)
+            print("[atom] ATOM_DISABLE_CUSTOM_AR=1: using PyNCCL allreduce", flush=True)
         init_dist_env(
             config.tensor_parallel_size,
             rankID=rank,
