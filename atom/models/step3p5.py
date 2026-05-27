@@ -11,6 +11,7 @@ from typing import Optional, Union
 import torch
 import torch.nn.functional as F
 
+from aiter import QuantType
 from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -33,6 +34,7 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.utils import atom_parameter
 from atom.utils.custom_register import direct_register_custom_op
+from atom.utils.forward_context import get_forward_context
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -184,6 +186,86 @@ def _swiglustep_moe_forward(
     limit = self.swiglu_limit
     inter_dim = self._inter_dim
     inter_pad = self._inter_pad
+
+    if self._use_ep:
+        # --- EP mode: dispatch via MoRI, local-expert matmul, combine ---
+        # local_E = self._w13_bf16.shape[0] = local_num_experts on this rank.
+        # MoRI dispatch returns dispatch_ids in GLOBAL expert ID space; we
+        # remap them to local IDs via self.experts.expert_map.  Without
+        # this remap the local matmul would index the wrong expert (or
+        # crash on out-of-bounds).
+        fused_experts = self.experts.quant_method.fused_experts
+        (
+            dispatch_a1,
+            dispatch_scale,
+            expert_tokens_meta,
+            dispatch_ids,
+            dispatch_weights,
+        ) = fused_experts._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.num_experts,
+            self.experts.expert_mask,
+            False,
+            QuantType.No,
+        )
+
+        # Decode-time buffer truncation (same as modular_kernel path).
+        context = get_forward_context().context
+        num_dispatchers = fused_experts.prepare_finalize.num_dispatchers()
+        total_valid = context.graph_bs * self.top_k * num_dispatchers
+        if total_valid < dispatch_a1.shape[0] and not context.is_prefill:
+            dispatch_a1 = dispatch_a1[:total_valid]
+            dispatch_ids = dispatch_ids[:total_valid]
+            dispatch_weights = dispatch_weights[:total_valid]
+
+        x_disp = dispatch_a1.to(torch.bfloat16)
+        disp_ids_2d = (
+            dispatch_ids.unsqueeze(1) if dispatch_ids.dim() == 1 else dispatch_ids
+        )
+        disp_wts_2d = (
+            dispatch_weights.unsqueeze(1)
+            if dispatch_weights.dim() == 1
+            else dispatch_weights
+        )
+
+        # Remap global → local expert IDs.  expert_map[g] = local_id or -1.
+        expert_map = self.experts.expert_map
+        if expert_map is not None:
+            disp_ids_2d = expert_map[disp_ids_2d.long()].to(disp_ids_2d.dtype)
+
+        local_E = self._w13_bf16.shape[0]
+        Md = x_disp.shape[0]
+        fused_out = torch.zeros(
+            Md, self.hidden_size, dtype=hidden_states.dtype, device=x_disp.device
+        )
+        for eid in range(local_E):
+            mask = disp_ids_2d == eid
+            token_mask = mask.any(dim=1)
+            if not token_mask.any():
+                continue
+            token_indices = token_mask.nonzero(as_tuple=True)[0]
+            x_sel = x_disp[token_indices]
+            w13 = self._w13_bf16[eid]
+            gate_up = x_sel @ w13.t()
+            gate = gate_up[:, :inter_dim]
+            up = gate_up[:, inter_pad : inter_pad + inter_dim]
+            act = F.silu(gate).clamp(max=limit) * up.clamp(-limit, limit)
+            w2 = self._w2_bf16[eid, :, :inter_dim]
+            down = act @ w2.t()
+            wts = disp_wts_2d[token_indices].unsqueeze(-1)
+            expert_wts = mask[token_indices].float().unsqueeze(-1)
+            per_token_wt = (wts * expert_wts).sum(dim=1)
+            fused_out[token_indices] += (per_token_wt * down).to(fused_out.dtype)
+
+        # Finalize: MoRI combine + slice to original M rows.  Pass dispatch_*
+        # (not topk_*) because the patched MoriPrepareAndFinalize.finalize
+        # uses these as the per-token weights/ids for combine.
+        return fused_experts._finalize(
+            None, fused_out, hidden_states, disp_wts_2d, disp_ids_2d, False
+        )
+
     x_bf16 = hidden_states.to(torch.bfloat16)
 
     if torch.cuda.is_current_stream_capturing():
@@ -318,24 +400,9 @@ class Step3p5MoE(nn.Module):
             config=config,
         )
 
-        # The swiglustep custom forward does its own per-rank expert matmuls
-        # against ``self._w13_bf16[eid]`` and therefore assumes every rank
-        # holds every expert.  With expert parallelism each rank only owns
-        # a slice of the experts (``local_num_experts < num_experts``) and
-        # needs cross-rank dispatch, which this code path does not implement.
-        # Disable the custom path under EP and fall back to the standard
-        # ``FusedMoE.forward_impl`` (which loses the swiglu clamp on the
-        # two layers that have a non-zero limit, but is functionally
-        # correct end-to-end).
-        if self.swiglu_limit > 0 and self.experts.use_ep:
-            logger.warning(
-                "Layer %d: swiglustep clamp disabled because expert "
-                "parallel is enabled; falling back to standard FusedMoE "
-                "(swiglu_limit=%.1f will be ignored on this layer).",
-                layer_idx,
-                self.swiglu_limit,
-            )
-            self.swiglu_limit = 0
+        # Track EP for the swiglustep custom op (see _swiglustep_moe_forward
+        # for the EP dispatch path that goes through MoRI all2all).
+        self._use_ep = self.experts.use_ep
         if self.swiglu_limit > 0:
             self._swiglustep_layer_name = f"{prefix}.swiglustep"
             atom_config = get_current_atom_config()
@@ -592,6 +659,7 @@ class Step3p5DecoderLayer(nn.Module):
                 prefix=f"{prefix}.moe",
                 layer_idx=layer_idx,
             )
+            self.ep_enabled = self.moe.experts.use_ep
             swiglu_limit_shared = config.get_swiglu_limit_shared(layer_idx)
             self.share_expert = Step3p5MLP(
                 hidden_size=config.hidden_size,
@@ -606,6 +674,7 @@ class Step3p5DecoderLayer(nn.Module):
         else:
             self.moe = None
             self.share_expert = None
+            self.ep_enabled = False
             self.mlp = Step3p5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
@@ -647,9 +716,19 @@ class Step3p5DecoderLayer(nn.Module):
         if self.is_moe:
             routed = self.moe(hidden_states)
             shared = self.share_expert(hidden_states)
-            hidden_states = routed + shared
             if self.tp_size > 1:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if self.ep_enabled:
+                    # MoRI combine already reduces routed across EP ranks;
+                    # only the shared-expert output still needs the TP
+                    # all-reduce.  Summing then all-reducing both would
+                    # double-count the routed contribution.
+                    shared = tensor_model_parallel_all_reduce(shared)
+                    hidden_states = routed + shared
+                else:
+                    hidden_states = routed + shared
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+            else:
+                hidden_states = routed + shared
         else:
             hidden_states = self.mlp(hidden_states)
 

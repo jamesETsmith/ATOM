@@ -82,8 +82,10 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        # Only use mori all2all kernels when expert parallel is enabled
-        return self.dp_size > 1 and self.use_ep and _has_module("mori")
+        # Use mori all2all kernels when expert parallel is enabled.
+        # Pure EP (dp_size=1, ep_size>1) still needs MoRI for all-to-all
+        # dispatch; the previous dp_size>1 gate incorrectly blocked this.
+        return self.use_ep and _has_module("mori")
 
     @property
     def use_mori_kernels(self):
@@ -337,7 +339,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 token_hidden_size=moe.hidden_dim,
                 scale_dim=scale_dim,
                 scale_type_size=torch.float32.itemsize,
-                max_num_tokens_per_dp_rank=16384,
+                max_num_tokens_per_dp_rank=moe.max_num_tokens,
                 # input_dtype=moe.in_dtype,
                 input_dtype=moe.in_dtype,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
@@ -361,7 +363,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 world_size=all2all_manager.world_size,
                 hidden_dim=moe.hidden_dim,
                 scale_dim=scale_dim,
-                max_num_inp_token_per_rank=16384,
+                max_num_inp_token_per_rank=moe.max_num_tokens,
                 num_local_experts=moe.num_experts // all2all_manager.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 gpu_per_node=moe.moe_parallel_config.local_ep_size,
