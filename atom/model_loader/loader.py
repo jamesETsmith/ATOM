@@ -498,9 +498,11 @@ def load_model(
                                 continue
 
                             # Generic call - model provides implementation details
-                            num_experts = getattr(
-                                hf_config, "n_routed_experts", 0
-                            ) or getattr(hf_config, "num_experts", 0)
+                            num_experts = (
+                                getattr(hf_config, "n_routed_experts", 0)
+                                or getattr(hf_config, "num_experts", 0)
+                                or getattr(hf_config, "moe_num_experts", 0)
+                            )
                             matched = load_fused_expert_weights_fn(
                                 name,  # Original checkpoint name
                                 name_mapped,  # Mapped parameter name

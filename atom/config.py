@@ -576,11 +576,35 @@ _CONFIG_REGISTRY: dict[str, str] = {
 }
 
 
+_ATOM_CONFIG_CLASSES: dict[str, tuple[str, str]] = {
+    "step3p5": ("atom.model_config.step3p5", "Step3p5Config"),
+}
+
+
+def _hf_config_from_dict(model_type: str, config_dict: dict) -> PretrainedConfig:
+    """Build HF config from a config dict, using ATOM config classes when needed."""
+    if model_type in _ATOM_CONFIG_CLASSES:
+        mod_path, cls_name = _ATOM_CONFIG_CLASSES[model_type]
+        import importlib
+
+        mod = importlib.import_module(mod_path)
+        config_class = getattr(mod, cls_name)
+        config_dict = config_dict.copy()
+        config_dict.pop("auto_map", None)
+        if hasattr(config_class, "from_dict"):
+            return config_class.from_dict(config_dict)
+        return config_class(**config_dict)
+    mapped_type = _CONFIG_REGISTRY.get(model_type, model_type)
+    config_class = AutoConfig.for_model(mapped_type)
+    return config_class.from_dict(config_dict)
+
+
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
+    "step3p7": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -626,9 +650,7 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
         text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
-        hf_config = config_class.from_dict(text_config_dict)
+        hf_config = _hf_config_from_dict(text_model_type, text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
         original_arch = config_dict.get("architectures", [])
@@ -668,6 +690,9 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             if not hasattr(hf_config, field):
                 setattr(hf_config, field, value)
         return hf_config
+    if model_type in _ATOM_CONFIG_CLASSES:
+        config_dict.pop("auto_map", None)
+        return _hf_config_from_dict(model_type, config_dict)
     try:
         hf_config = AutoConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code
