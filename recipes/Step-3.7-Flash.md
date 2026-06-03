@@ -45,7 +45,7 @@ print('imports ok')
 Download weights once per node:
 
 ```bash
-huggingface-cli download stepfun-ai/Step-3.7-Flash-FP8 \
+hf download stepfun-ai/Step-3.7-Flash-FP8 \
   --local-dir /data/jamesmit/models/Step-3.7-Flash-FP8
 ```
 
@@ -92,7 +92,7 @@ python -m atom.benchmarks.benchmark_serving \
 
 | Scenario | ISL | OSL | Concurrency | Num prompts | Total tok/s | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | Mean E2EL (ms) | Status |
 | -------- | --: | --: | ----------: | ----------: | ----------: | -----------: | -------------: | -------------: | -------------: | ------ |
-| Smoke    | 1024 | 1024 | 4 | 40 | | | | | | Pending verify |
+| Smoke    | 1024 | 1024 | 4 | 40 | 695 | 346 | 201 | 11.0 | 10291 | Verified 2026-06-02 |
 
 ## Accuracy Validation
 
@@ -108,7 +108,7 @@ lm_eval \
 
 | Date | ATOM commit | Topology | Task | Metric | Score | Notes |
 | ---- | ----------- | -------- | ---- | ------ | ----: | ----- |
-| | | TP=8 no-EP | GSM8K-5shot | flexible-extract | | Pending verify |
+| 2026-06-02 | feat/step-3.7-flash | TP=8 no-EP | GSM8K-5shot | flexible-extract | 88.78% | MI325X gfx942 |
 
 ## Caveats
 
@@ -122,7 +122,7 @@ lm_eval \
 
 | Field | Value |
 | ----- | ----- |
-| Recipe verified | Pending |
-| GPU | |
-| ATOM commit | |
+| Recipe verified | 2026-06-02 |
+| GPU | MI325X (gfx942), 8× GPU |
+| ATOM commit | feat/step-3.7-flash (post-5cf48f64: MoE FP8 block-scale TP shard fix) |
 | Required exports | `ROCM_HOME`/`ROCM_PATH` → `_rocm_sdk_devel` if AITER JIT fails |

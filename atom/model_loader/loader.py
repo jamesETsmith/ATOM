@@ -513,7 +513,10 @@ def load_model(
                             )
 
                             if matched:
+                                # Record ckpt and model param names so the
+                                # unloaded-params check sees fused MoE slots.
                                 loaded_weights_record.add(prefix + name)
+                                loaded_weights_record.add(prefix + name_mapped)
                                 break
 
                         if matched:

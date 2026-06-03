@@ -126,14 +126,7 @@ def _dequant_fp8_blockscale(
     block_n: int = 128,
     block_k: int = 128,
 ) -> torch.Tensor:
-    """Dequantize FP8 block-scaled weight to bf16.
-
-    Args:
-        weight_fp8: [N, K] float8_e4m3fnuz weight (already unshuffled).
-        scale: [ceil(N/block_n), ceil(K/block_k)] float32 block scales.
-    Returns:
-        [N, K] bf16 dequantized weight.
-    """
+    """Dequantize FP8 block-scaled weight to bf16."""
     N, K = weight_fp8.shape
     sn, sk = scale.shape
     out = weight_fp8.to(torch.float32).view(sn, block_n, sk, block_k)
@@ -925,6 +918,18 @@ class Step3p5ForCausalLM(nn.Module):
         ]
 
     @staticmethod
+    def _fused_scale_param_name(weight_name: str) -> str:
+        if weight_name.endswith("w13_weight"):
+            return weight_name.replace("w13_weight", "w13_weight_scale", 1)
+        if weight_name.endswith("w2_weight"):
+            return weight_name.replace("w2_weight", "w2_weight_scale", 1)
+        if weight_name.endswith("w13_weight_scale"):
+            return weight_name
+        if weight_name.endswith("w2_weight_scale"):
+            return weight_name
+        raise ValueError(f"unexpected fused MoE param name: {weight_name}")
+
+    @staticmethod
     def load_fused_expert_weights(
         original_name: str,
         name: str,
@@ -933,15 +938,10 @@ class Step3p5ForCausalLM(nn.Module):
         shard_id: str,
         num_experts: int,
     ) -> bool:
-        """Unpack a stacked [num_experts, ...] tensor into per-expert slots.
-
-        The per-rank intermediate size must be block-aligned for FP8
-        block-quant.  On AMD with this model, use ``--tp 8
-        --enable-expert-parallel`` so each rank holds whole experts at the
-        un-split intermediate size (1280), keeping block alignment intact.
-        """
+        """Unpack stacked [num_experts, ...] expert tensors into per-expert slots."""
         if name not in params_dict:
             return False
+
         param = params_dict[name]
         weight_loader = param.weight_loader
         loaded_any = False
